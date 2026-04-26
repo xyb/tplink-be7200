@@ -1,0 +1,23 @@
+[project]
+name = "tplink-be7200"
+version = "0.1.0"
+description = "Python SDK + CLI for the TP-Link BE7200 (TL-7DR7270) Web UI API"
+requires-python = ">=3.10"
+authors = [{name = "xyb"}]
+dependencies = []  # standard library only
+license = {text = "MIT"}
+readme = "README.md"
+
+[project.urls]
+Homepage = "https://github.com/xyb/tplink-be7200"
+Repository = "https://github.com/xyb/tplink-be7200"
+
+[project.scripts]
+tplink-be7200 = "tplink_be7200.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tplink_be7200*"]
