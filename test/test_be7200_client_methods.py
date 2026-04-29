@@ -85,19 +85,19 @@ class TestLowLevelHelpers(unittest.TestCase):
 
     def test_set_builds_section_payload(self):
         c = _make_client({'error_code': 0})
-        c.set('network', 'lan', {'ipaddr': '192.168.50.1'})
+        c.set('network', 'lan', {'ipaddr': '192.0.2.1'})
         self.assertEqual(c._session.posts[0]['json'], {
-            'network': {'lan': {'ipaddr': '192.168.50.1'}}, 'method': 'set',
+            'network': {'lan': {'ipaddr': '192.0.2.1'}}, 'method': 'set',
         })
 
     def test_add_builds_table_para_payload(self):
         c = _make_client({'error_code': 0})
         c.add('ip_mac_bind', 'user_bind', 'user_bind_1',
-              {'ip': '192.168.50.10', 'mac': 'aa-bb-cc-dd-ee-ff', 'hostname': 'h'})
+              {'ip': '192.0.2.10', 'mac': 'aa-bb-cc-dd-ee-ff', 'hostname': 'h'})
         self.assertEqual(c._session.posts[0]['json'], {
             'ip_mac_bind': {
                 'table': 'user_bind', 'name': 'user_bind_1',
-                'para': {'ip': '192.168.50.10', 'mac': 'aa-bb-cc-dd-ee-ff', 'hostname': 'h'},
+                'para': {'ip': '192.0.2.10', 'mac': 'aa-bb-cc-dd-ee-ff', 'hostname': 'h'},
             },
             'method': 'add',
         })
@@ -125,21 +125,21 @@ class TestLanWan(unittest.TestCase):
 
     def test_set_lan_ip_uses_manual_mode(self):
         c = _make_client({'error_code': 0})
-        c.set_lan_ip('192.168.50.1')
+        c.set_lan_ip('192.0.2.1')
         body = c._session.posts[0]['json']
         self.assertEqual(body['network']['lan']['ip_mode'], 'manual')
-        self.assertEqual(body['network']['lan']['ipaddr'], '192.168.50.1')
+        self.assertEqual(body['network']['lan']['ipaddr'], '192.0.2.1')
 
     def test_set_lan_and_dhcp_atomic(self):
         c = _make_client({'error_code': 0})
-        c.set_lan_and_dhcp('192.168.50.1',
-                           dhcp_pool_start='192.168.50.100',
-                           dhcp_pool_end='192.168.50.200',
+        c.set_lan_and_dhcp('192.0.2.1',
+                           dhcp_pool_start='192.0.2.100',
+                           dhcp_pool_end='192.0.2.200',
                            dhcp_lease=7200)
         body = c._session.posts[0]['json']
         self.assertEqual(body['method'], 'set')
-        self.assertEqual(body['network']['lan']['ipaddr'], '192.168.50.1')
-        self.assertEqual(body['dhcpd']['udhcpd']['pool_start'], '192.168.50.100')
+        self.assertEqual(body['network']['lan']['ipaddr'], '192.0.2.1')
+        self.assertEqual(body['dhcpd']['udhcpd']['pool_start'], '192.0.2.100')
         self.assertEqual(body['dhcpd']['udhcpd']['lease_time'], '7200')
 
     def test_get_wan_status(self):
@@ -216,11 +216,11 @@ class TestBindings(unittest.TestCase):
 class TestClients(unittest.TestCase):
     def test_list_clients_decodes_hostname(self):
         c = _make_client({'error_code': 0, 'hosts_info': {'online_host': [
-            {'host_1': {'mac': 'aa-bb-cc-dd-ee-01', 'ip': '192.168.1.10',
-                       'hostname': '%E6%97%A9%E6%97%A9'}},
+            {'host_1': {'mac': 'aa-bb-cc-dd-ee-01', 'ip': '192.0.2.10',
+                       'hostname': '%E6%B5%8B%E8%AF%95'}},
         ]}})
         rows = c.list_clients()
-        self.assertEqual(rows[0]['hostname'], '早早')
+        self.assertEqual(rows[0]['hostname'], '测试')
 
     def test_list_clients_offline_uses_host_info_table(self):
         c = _make_client({'error_code': 0, 'hosts_info': {'host_info': []}})
@@ -492,12 +492,12 @@ class TestMacAcl(unittest.TestCase):
         c = _make_client([
             {'error_code': 0, 'wlan_access': {'config': {'enable': '1'}}},
             {'error_code': 0, 'wlan_access': {'white_list': [
-                {'white_list_1': {'mac': 'aa-bb-cc-dd-ee-01', 'name': '%E6%97%A9%E6%97%A9'}},
+                {'white_list_1': {'mac': 'aa-bb-cc-dd-ee-01', 'name': '%E6%B5%8B%E8%AF%95'}},
             ]}},
         ])
         a = c.get_mac_acl()
         self.assertEqual(a['enable'], '1')
-        self.assertEqual(a['white_list'][0]['hostname'], '早早')
+        self.assertEqual(a['white_list'][0]['hostname'], '测试')
 
     def test_set_mac_acl_mode_validates(self):
         c = _make_client({'error_code': 0})
