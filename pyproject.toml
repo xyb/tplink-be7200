@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Python SDK + CLI for the TP-Link BE7200 (TL-7DR7270) Web UI API"
 requires-python = ">=3.10"
 authors = [{name = "xyb"}]
-dependencies = []  # standard library only
+dependencies = [
+    "tplinkrouterc6u>=5.18.1",  # MD5 nonce login for TL-7DR7270 1.0.18+ (PR #155)
+]
 license = {text = "MIT"}
 readme = "README.md"
 
