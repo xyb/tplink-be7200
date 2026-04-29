@@ -33,18 +33,29 @@ Subcommands at a glance:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import getpass
 import json
 import os
 import sys
 
-from . import API, ApiError, __version__, cache, login as do_login
+from . import BE7200Client, BE7200ApiError, __version__, cache
+
+# stale-token signal from the router (auth check failed; cached stok rejected)
+_AUTH_ERROR_CODE = -40401
 
 
-def _api(args) -> API:
-    """Resolve a token in the order: --token > TPLINK_STOK > cache > auto-login."""
+def _client(args) -> BE7200Client:
+    """Resolve credentials in order: --token > TPLINK_STOK > cache > auto-login.
+
+    Returns a BE7200Client whose `_stok` is already populated. Cached
+    tokens are validated lazily — the first request that fails with the
+    router's auth error code (-40401) clears the cache and re-authorizes
+    using `TPLINK_PASSWORD` if available.
+    """
     host = args.host
     no_cache = getattr(args, "no_cache", False)
+    verbose = getattr(args, "verbose", False)
 
     token = args.token or os.environ.get("TPLINK_STOK", "")
     src = "arg/env"
@@ -52,26 +63,42 @@ def _api(args) -> API:
         token = cache.load(host) or ""
         if token:
             src = "cache"
-    if not token:
-        password = os.environ.get("TPLINK_PASSWORD", "")
-        if password:
-            api = do_login(password, host=host)
-            cache.save(host, api.token)
-            return api
-        sys.exit(
-            "no token. provide one of:\n"
-            "  1. tplink-be7200 login              # interactive password, writes cache\n"
-            "  2. --token XXX\n"
-            "  3. export TPLINK_STOK=XXX\n"
-            "  4. export TPLINK_PASSWORD=XXX     # auto-login"
-        )
-    if getattr(args, "verbose", False):
-        print(f"[token from {src}]", file=sys.stderr)
-    return API(token=token, host=host)
+
+    if token:
+        if verbose:
+            print(f"[token from {src}]", file=sys.stderr)
+        return BE7200Client.from_cached_stok(host, token)
+
+    password = os.environ.get("TPLINK_PASSWORD", "")
+    if password:
+        if verbose:
+            print("[token: auto-login via TPLINK_PASSWORD]", file=sys.stderr)
+        client = BE7200Client(host, password)
+        client.authorize()
+        if not no_cache:
+            cache.save(host, client._stok)
+        return client
+
+    sys.exit(
+        "no token. provide one of:\n"
+        "  1. tplink-be7200 login              # interactive password, writes cache\n"
+        "  2. --token XXX\n"
+        "  3. export TPLINK_STOK=XXX\n"
+        "  4. export TPLINK_PASSWORD=XXX     # auto-login"
+    )
 
 
 def _print(obj):
     print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def _to_jsonable(obj):
+    """Convert c6u dataclass results to plain dicts so JSON output stays JSON."""
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return dataclasses.asdict(obj)
+    if isinstance(obj, list):
+        return [_to_jsonable(x) for x in obj]
+    return obj
 
 
 # ============================================================================
@@ -86,26 +113,22 @@ def cmd_login(args):
       1. The `TPLINK_PASSWORD` env var (intended for scripts; note the
          process environment is readable by other processes on the host).
       2. Interactive `getpass` prompt (default; no echo, no shell history).
-
-    The previous `-p PASSWORD` and `--password-stdin` options were removed
-    because:
-      - `-p` exposes the password through shell history and `ps`.
-      - `--password-stdin` invoked as `echo "..." | login` also leaves the
-        password in shell history.
     """
     pwd = os.environ.get("TPLINK_PASSWORD") or getpass.getpass("admin password: ")
     if not pwd:
         sys.exit("empty password")
-    api = do_login(pwd, host=args.host)
+    client = BE7200Client(args.host, pwd)
+    client.authorize()
+    token = client._stok
     if not args.no_cache:
-        p = cache.save(args.host, api.token)
+        p = cache.save(args.host, token)
         print(f"# token cached: {p}", file=sys.stderr)
     if args.export:
-        print(f"export TPLINK_STOK={api.token}")
+        print(f"export TPLINK_STOK={token}")
     elif args.json:
-        _print({"stok": api.token, "host": args.host})
+        _print({"stok": token, "host": args.host})
     else:
-        print(api.token)
+        print(token)
 
 
 def cmd_cache_show(args):
@@ -124,8 +147,8 @@ def cmd_cache_clear(args):
 
 
 def cmd_export(args):
-    api = _api(args)
-    data = api.export_all()
+    client = _client(args)
+    data = client.export_all()
     if args.output:
         with open(args.output, "w") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -135,27 +158,27 @@ def cmd_export(args):
 
 
 def cmd_get(args):
-    api = _api(args)
+    client = _client(args)
     kwargs = {}
     if args.name:
         kwargs["name"] = args.name
     if args.table:
         kwargs["table"] = args.table
-    _print(api.get(args.module, **kwargs))
+    _print(client.get(args.module, **kwargs))
 
 
 def cmd_raw(args):
-    api = _api(args)
+    client = _client(args)
     body = json.loads(args.body)
-    _print(api.call(body))
+    _print(client.call(body))
 
 
 # --- bindings ---
 
 
 def cmd_bindings_list(args):
-    api = _api(args)
-    rows = api.list_bindings()
+    client = _client(args)
+    rows = client.list_bindings()
     if args.json:
         _print(rows)
         return
@@ -165,22 +188,22 @@ def cmd_bindings_list(args):
 
 
 def cmd_bindings_add(args):
-    api = _api(args)
-    name = api.add_binding(ip=args.ip, mac=args.mac, hostname=args.hostname)
+    client = _client(args)
+    name = client.add_binding(ip=args.ip, mac=args.mac, hostname=args.hostname)
     print(f"added: {name}  {args.mac} -> {args.ip}  {args.hostname}")
 
 
 def cmd_bindings_delete(args):
-    api = _api(args)
-    api.delete_binding(args.name)
+    client = _client(args)
+    client.delete_binding(args.name)
     print(f"deleted: {args.name}")
 
 
 def cmd_bindings_clear(args):
-    api = _api(args)
+    client = _client(args)
     if not args.yes:
         sys.exit("pass --yes to confirm clear")
-    api.clear_bindings(max_scan=args.max_scan)
+    client.clear_bindings(max_scan=args.max_scan)
     print(f"cleared (scanned 1..{args.max_scan})")
 
 
@@ -188,11 +211,11 @@ def cmd_bindings_import_csv(args):
     """CSV columns: mac, ip, hostname (hostname optional)."""
     import csv
 
-    api = _api(args)
+    client = _client(args)
     if args.cleanup:
         if not args.yes:
             sys.exit("--cleanup requires --yes")
-        api.clear_bindings()
+        client.clear_bindings()
         print("cleared existing")
     with open(args.path) as f:
         reader = csv.DictReader(f) if args.has_header else csv.reader(f)
@@ -205,9 +228,9 @@ def cmd_bindings_import_csv(args):
             mac, ip = row[0], row[1]
             hostname = row[2] if len(row) > 2 else ""
         try:
-            name = api.add_binding(ip=ip, mac=mac, hostname=hostname, index=i)
+            name = client.add_binding(ip=ip, mac=mac, hostname=hostname, index=i)
             print(f"  {i:3d}. {name}  {mac} -> {ip}  {hostname}  OK")
-        except ApiError as e:
+        except BE7200ApiError as e:
             print(f"  {i:3d}. FAIL: {mac} -> {ip}  {e}")
 
 
@@ -215,16 +238,16 @@ def cmd_bindings_import_csv(args):
 
 
 def cmd_wifi_show(args):
-    _print(_api(args).get_wifi())
+    _print(_client(args).get_wifi())
 
 
 def cmd_wifi_set(args):
-    api = _api(args)
+    client = _client(args)
     if args.band in ("2g", "both"):
-        api.set_wifi_2g(ssid=args.ssid, key=args.psk)
+        client.set_wifi_2g(ssid=args.ssid, key=args.psk)
         print(f"2.4G set: ssid={args.ssid} psk={'*' * len(args.psk) if args.psk else None}")
     if args.band in ("5g", "both"):
-        api.set_wifi_5g(ssid=args.ssid + "_5G" if args.ssid and args.band == "both" else args.ssid, key=args.psk)
+        client.set_wifi_5g(ssid=args.ssid + "_5G" if args.ssid and args.band == "both" else args.ssid, key=args.psk)
         print(f"5G   set: ssid={args.ssid}{('_5G' if args.band=='both' else '')} psk={'*' * len(args.psk) if args.psk else None}")
 
 
@@ -232,12 +255,12 @@ def cmd_wifi_set(args):
 
 
 def cmd_pppoe_show(args):
-    _print(_api(args).get_pppoe())
+    _print(_client(args).get_pppoe())
 
 
 def cmd_pppoe_set(args):
-    api = _api(args)
-    api.set_pppoe(username=args.username, password=args.password, mtu=args.mtu)
+    client = _client(args)
+    client.set_pppoe(username=args.username, password=args.password, mtu=args.mtu)
     print(f"PPPoE set: username={args.username} mtu={args.mtu} (wan_type switched to pppoe)")
 
 
@@ -245,22 +268,22 @@ def cmd_pppoe_set(args):
 
 
 def cmd_lan_show(args):
-    _print(_api(args).get_lan())
+    _print(_client(args).get_lan())
 
 
 def cmd_lan_set_ip(args):
-    api = _api(args)
-    api.set_lan_ip(args.ipaddr, args.netmask)
+    client = _client(args)
+    client.set_lan_ip(args.ipaddr, args.netmask)
     print(f"LAN IP -> {args.ipaddr}/{args.netmask} (router IP changed, use new address next time)")
 
 
 def cmd_dhcp_show(args):
-    _print(_api(args).get_dhcp_server())
+    _print(_client(args).get_dhcp_server())
 
 
 def cmd_dhcp_set(args):
-    api = _api(args)
-    api.set_dhcp_server(
+    client = _client(args)
+    client.set_dhcp_server(
         pool_start=args.pool_start,
         pool_end=args.pool_end,
         lease_time=args.lease,
@@ -271,17 +294,17 @@ def cmd_dhcp_set(args):
 
 
 def cmd_wan_show(args):
-    api = _api(args)
-    _print({"wan": api.get_wan(), "status": api.get_wan_status()})
+    client = _client(args)
+    _print({"wan": client.get_wan(), "status": client.get_wan_status()})
 
 
 def cmd_device_info(args):
-    _print(_api(args).get_device_info())
+    _print(_client(args).get_device_info())
 
 
 def cmd_guest_show(args):
-    api = _api(args)
-    g = api.get_guest()
+    client = _client(args)
+    g = client.get_guest()
     if args.json:
         _print(g)
         return
@@ -308,20 +331,20 @@ def cmd_guest_show(args):
 
 
 def cmd_guest_enable(args):
-    api = _api(args)
-    api.enable_guest(band=args.band)
+    client = _client(args)
+    client.enable_guest(band=args.band)
     print(f"[{args.band.upper()}] guest network enabled")
 
 
 def cmd_guest_disable(args):
-    api = _api(args)
-    api.disable_guest(band=args.band)
+    client = _client(args)
+    client.disable_guest(band=args.band)
     print(f"[{args.band.upper()}] guest network disabled")
 
 
 def cmd_guest_set(args):
-    api = _api(args)
-    api.set_guest(
+    client = _client(args)
+    client.set_guest(
         ssid=args.ssid,
         key=args.psk,
         encrypt="3" if args.psk else None,
@@ -336,8 +359,8 @@ def cmd_guest_set(args):
 # --- port-forward ---
 
 def cmd_pf_list(args):
-    api = _api(args)
-    rows = api.list_port_forwards()
+    client = _client(args)
+    rows = client.list_port_forwards()
     if args.json:
         _print(rows); return
     print(f"{'NAME':<14} {'PROTO':<7} {'EXT':<13} {'→':<2} INTERNAL")
@@ -348,8 +371,8 @@ def cmd_pf_list(args):
 
 
 def cmd_pf_add(args):
-    api = _api(args)
-    name = api.add_port_forward(
+    client = _client(args)
+    name = client.add_port_forward(
         dest_ip=args.dest_ip, dest_port=args.dest_port,
         src_port_start=args.src_start, src_port_end=args.src_end,
         proto=args.proto,
@@ -358,71 +381,71 @@ def cmd_pf_add(args):
 
 
 def cmd_pf_delete(args):
-    _api(args).delete_port_forward(args.name); print(f"deleted {args.name}")
+    _client(args).delete_port_forward(args.name); print(f"deleted {args.name}")
 
 
 def cmd_pf_clear(args):
     if not args.yes:
         sys.exit("--yes required")
-    _api(args).clear_port_forwards()
+    _client(args).clear_port_forwards()
     print("cleared")
 
 
 # --- dmz ---
 
 def cmd_dmz_show(args):
-    _print(_api(args).get_dmz())
+    _print(_client(args).get_dmz())
 
 
 def cmd_dmz_set(args):
-    _api(args).set_dmz(enable=True, dest_ip=args.ip)
+    _client(args).set_dmz(enable=True, dest_ip=args.ip)
     print(f"DMZ enabled -> {args.ip}")
 
 
 def cmd_dmz_off(args):
-    _api(args).set_dmz(enable=False)
+    _client(args).set_dmz(enable=False)
     print("DMZ disabled")
 
 
 # --- ddns ---
 
 def cmd_ddns_show(args):
-    _print(_api(args).get_ddns())
+    _print(_client(args).get_ddns())
 
 
 def cmd_ddns_set(args):
-    _api(args).set_ddns(args.username, args.password)
+    _client(args).set_ddns(args.username, args.password)
     print(f"DDNS set: {args.username}")
 
 
 # --- upnp ---
 
 def cmd_upnp_show(args):
-    api = _api(args)
-    cfg = api.get_upnp()
+    client = _client(args)
+    cfg = client.get_upnp()
     print(f"UPnP: {'ON' if cfg.get('enable_upnp') == '1' else 'OFF'}")
     if args.leases:
-        for l in api.list_upnp_leases():
+        for l in client.list_upnp_leases():
             print(f"  {l}")
 
 
 def cmd_upnp_enable(args):
-    _api(args).set_upnp(True); print("UPnP ON")
+    _client(args).set_upnp(True); print("UPnP ON")
 
 
 def cmd_upnp_disable(args):
-    _api(args).set_upnp(False); print("UPnP OFF")
+    _client(args).set_upnp(False); print("UPnP OFF")
 
 
 # --- ap-isolate ---
 
 def cmd_apiso_show(args):
-    iso = _api(args).get_ap_isolate()
+    iso = _client(args).get_ap_isolate()
     print(f"AP isolation: 2G={'ON' if iso['2g'] else 'OFF'}  5G={'ON' if iso['5g'] else 'OFF'}")
 
 
 def cmd_apiso_set(args):
-    _api(args).set_ap_isolate(isolate=args.on, band=args.band)
+    _client(args).set_ap_isolate(isolate=args.on, band=args.band)
     print(f"[{args.band.upper()}] isolation -> {'ON' if args.on else 'OFF'}")
 
 
@@ -437,7 +460,7 @@ def _parse_days(s: str | None) -> list[str]:
 
 
 def cmd_wifi_timer_show(args):
-    t = _api(args).get_wifi_timer()
+    t = _client(args).get_wifi_timer()
     print(f"WiFi timer: {'ON' if t['enable'] else 'OFF'}")
     for r in t["rules"]:
         days = ",".join(d for d in DAYS_FULL if r.get(d) == "1") or "none"
@@ -445,15 +468,15 @@ def cmd_wifi_timer_show(args):
 
 
 def cmd_wifi_timer_enable(args):
-    _api(args).set_wifi_timer_enable(True); print("WiFi timer ON")
+    _client(args).set_wifi_timer_enable(True); print("WiFi timer ON")
 
 
 def cmd_wifi_timer_disable(args):
-    _api(args).set_wifi_timer_enable(False); print("WiFi timer OFF")
+    _client(args).set_wifi_timer_enable(False); print("WiFi timer OFF")
 
 
 def cmd_wifi_timer_add(args):
-    name = _api(args).add_wifi_timer_rule(
+    name = _client(args).add_wifi_timer_rule(
         start=args.start, end=args.end,
         days=_parse_days(args.days), name=args.name,
     )
@@ -461,11 +484,11 @@ def cmd_wifi_timer_add(args):
 
 
 def cmd_wifi_timer_delete(args):
-    _api(args).delete_wifi_timer_rule(args.name); print(f"deleted {args.name}")
+    _client(args).delete_wifi_timer_rule(args.name); print(f"deleted {args.name}")
 
 
 def cmd_reboot_timer_show(args):
-    t = _api(args).get_reboot_timer()
+    t = _client(args).get_reboot_timer()
     print(f"Reboot timer: {'ON' if t['enable'] else 'OFF'}")
     for r in t["rules"]:
         days = ",".join(d for d in DAYS_FULL if r.get(d) == "1") or "none"
@@ -473,28 +496,28 @@ def cmd_reboot_timer_show(args):
 
 
 def cmd_reboot_timer_enable(args):
-    _api(args).set_reboot_timer_enable(True); print("Reboot timer ON")
+    _client(args).set_reboot_timer_enable(True); print("Reboot timer ON")
 
 
 def cmd_reboot_timer_disable(args):
-    _api(args).set_reboot_timer_enable(False); print("Reboot timer OFF")
+    _client(args).set_reboot_timer_enable(False); print("Reboot timer OFF")
 
 
 def cmd_reboot_timer_add(args):
-    name = _api(args).add_reboot_timer_rule(
+    name = _client(args).add_reboot_timer_rule(
         reboot_time=args.time, days=_parse_days(args.days), name=args.name,
     )
     print(f"added {name}: at {args.time} on {args.days or 'all'}")
 
 
 def cmd_reboot_timer_delete(args):
-    _api(args).delete_reboot_timer_rule(args.name); print(f"deleted {args.name}")
+    _client(args).delete_reboot_timer_rule(args.name); print(f"deleted {args.name}")
 
 
 # --- wol ---
 
 def cmd_wol_list(args):
-    rows = _api(args).list_wol_devices()
+    rows = _client(args).list_wol_devices()
     if args.json:
         _print(rows); return
     print(f"{'NAME':<22} {'MAC':<19} {'IP':<16} {'STATE'}")
@@ -504,25 +527,25 @@ def cmd_wol_list(args):
 
 
 def cmd_wol_wake(args):
-    r = _api(args).wake(args.mac)
+    r = _client(args).wake(args.mac)
     print(f"wake sent: {args.mac}  resp={r}")
 
 
-# --- admin-lock ---
+# --- signal / mac-acl / admin-lock ---
 
 def cmd_signal_show(args):
-    s = _api(args).get_signal_power()
+    s = _client(args).get_signal_power()
     name = {"0": "boost", "1": "normal", "2": "saving"}
     print(f"signal power: 2G={name.get(s['2g'], s['2g'])}  5G={name.get(s['5g'], s['5g'])}  (available: {s['available']})")
 
 
 def cmd_signal_set(args):
-    _api(args).set_signal_power(level=args.level, band=args.band)
+    _client(args).set_signal_power(level=args.level, band=args.band)
     print(f"[{args.band.upper()}] signal -> {args.level}")
 
 
 def cmd_macacl_show(args):
-    a = _api(args).get_mac_acl()
+    a = _client(args).get_mac_acl()
     mode = {"0": "off", "1": "whitelist"}.get(a["enable"], a["enable"])
     print(f"MAC ACL mode: {mode}")
     print(f"\nwhitelist ({len(a['white_list'])}):")
@@ -537,29 +560,29 @@ def cmd_macacl_show(args):
 def cmd_macacl_mode(args):
     if args.mode == "whitelist" and not args.yes:
         sys.exit("whitelist mode locks out everyone not on the list. Add --yes to confirm.")
-    _api(args).set_mac_acl_mode(args.mode)
+    _client(args).set_mac_acl_mode(args.mode)
     print(f"MAC ACL mode -> {args.mode}")
 
 
 def cmd_macacl_add(args):
-    _api(args).add_mac_acl(mac=args.mac, hostname=args.hostname)
+    _client(args).add_mac_acl(mac=args.mac, hostname=args.hostname)
     print(f"added {args.mac}  {args.hostname}")
 
 
 def cmd_macacl_delete(args):
-    _api(args).delete_mac_acl(args.mac)
+    _client(args).delete_mac_acl(args.mac)
     print(f"deleted {args.mac}")
 
 
 def cmd_macacl_clear(args):
     if not args.yes:
         sys.exit("--yes required (will lock out everyone if mode=whitelist)")
-    _api(args).clear_mac_acl()
+    _client(args).clear_mac_acl()
     print("whitelist cleared")
 
 
 def cmd_admin_show(args):
-    a = _api(args).get_admin_lock()
+    a = _client(args).get_admin_lock()
     if a["enable_all"]:
         print("admin login: open to all clients")
     else:
@@ -574,18 +597,18 @@ def cmd_admin_lock(args):
         sys.exit("at least one MAC required")
     if len(macs) > 4:
         sys.exit("max 4 MACs supported by router")
-    _api(args).set_admin_lock(enable_all=False, allowed_macs=macs)
+    _client(args).set_admin_lock(enable_all=False, allowed_macs=macs)
     print(f"admin login restricted to {len(macs)} MAC(s): {macs}")
 
 
 def cmd_admin_open(args):
-    _api(args).set_admin_lock(enable_all=True)
+    _client(args).set_admin_lock(enable_all=True)
     print("admin login opened to all")
 
 
 def cmd_clients(args):
-    api = _api(args)
-    rows = api.list_clients(include_offline=args.all)
+    client = _client(args)
+    rows = client.list_clients(include_offline=args.all)
     if args.json:
         _print(rows)
         return
@@ -937,7 +960,18 @@ def main():
             print(warn, file=sys.stderr)
     try:
         args.func(args)
-    except ApiError as e:
+    except BE7200ApiError as e:
+        # If the cached token is stale, try to clear it and re-login if a
+        # password is available; otherwise surface the error.
+        if e.code == _AUTH_ERROR_CODE and not getattr(args, "no_cache", False):
+            cache.clear(args.host)
+            if os.environ.get("TPLINK_PASSWORD"):
+                print("[cached token stale; cleared cache, retry the command]", file=sys.stderr)
+            else:
+                print(
+                    "[cached token stale; cleared cache. set TPLINK_PASSWORD or run "
+                    "`tplink-be7200 login` and retry]", file=sys.stderr,
+                )
         print(f"API error: {e}", file=sys.stderr)
         sys.exit(1)
 
