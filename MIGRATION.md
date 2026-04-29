@@ -42,17 +42,24 @@ ASUS NVRAM migration helper.
 ## Plan
 
 1. Add `tplinkrouterc6u >= 5.18.1` to `pyproject.toml` deps. ✓
-2. Replace `tplink_be7200/auth.py` — c6u handles login.
-3. New `tplink_be7200/client.py`: a `BE7200Client(TPLinkXDRClient)` subclass
-   that adds the extended write methods listed above. Uses c6u's `_request`
-   internally.
-4. Rewrite `tplink_be7200/api.py` to be a thin facade over `BE7200Client`
-   (or delete it and have `cli.py` import the subclass directly).
-5. Rewrite `cli.py` command-by-command, in roughly this order:
-   - `login`, `device-info`, `wifi show`, `dhcp show`, `lan show`,
-     `wan show`, `bindings list` (read-only, c6u-direct, lowest risk)
-   - `wifi enable/disable`, `guest enable/disable` (c6u write, low risk)
-   - `wifi set` detail, `bindings add/delete`, `pppoe`, `lan set-ip`,
-     `dhcp set`, `pf` (extended write, our own implementation)
-6. Test against live TL-7DR7270 1.0.18+ at each phase before merging the
-   branch back to `main`.
+2. Delete `tplink_be7200/auth.py` — c6u handles login. ✓
+3. New `tplink_be7200/client.py`: `BE7200Client(TPLinkXDRClient)` subclass
+   adding the extended write surface. ✓
+4. Delete `tplink_be7200/api.py`; `cli.py` imports `BE7200Client` directly. ✓
+5. Rewrite `cli.py` command-by-command, every command now goes through
+   `BE7200Client` either via c6u's own methods or our extension methods. ✓
+6. Test against live TL-7DR7270 1.0.18+ before merging the branch back to
+   `main`. **Pending — needs live device.** Mock tests (60 total) pass.
+
+## Post-migration status (2026-04-29)
+
+- `tplink_be7200.API` / `tplink_be7200.login` are gone. New entry point:
+  `from tplink_be7200 import BE7200Client, BE7200ApiError, cache`.
+- `BE7200Client.from_cached_stok(host, stok)` lets cli.py keep the
+  "log in once, reuse the cached stok" UX without re-running authorize on
+  every command.
+- Stale-cache fallback is implemented in `cli._client(args)`: on auth
+  error the cache is cleared and a password authorize is retried (using
+  `TPLINK_PASSWORD` env var or interactive `getpass`).
+- 60 mock unit tests in `test/` cover the client surface; live verification
+  on TL-7DR7270 still TODO before merging to `main`.
