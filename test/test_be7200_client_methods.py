@@ -201,16 +201,37 @@ class TestBindings(unittest.TestCase):
         # only the add call, no list query
         self.assertEqual(len(c._session.posts), 1)
 
-    def test_delete_binding_passes_section_name(self):
+    def test_delete_binding_uses_list_form_payload(self):
+        # The web UI's actual delete payload (verified 2026-05-03 by
+        # capturing the live request): name is a LIST under ip_mac_bind,
+        # no `table` field. Earlier code sent name as a string with
+        # `table: user_bind`; firmware misinterpreted that as "delete
+        # all" and truncated the table.
         c = _make_client({'error_code': 0})
         c.delete_binding('user_bind_3')
         body = c._session.posts[0]['json']
-        self.assertEqual(body['ip_mac_bind']['name'], 'user_bind_3')
+        self.assertEqual(body['ip_mac_bind']['name'], ['user_bind_3'])
+        self.assertNotIn('table', body['ip_mac_bind'])
+        self.assertEqual(body['method'], 'delete')
 
-    def test_clear_bindings_iterates(self):
-        c = _make_client({'error_code': -40205})  # every delete returns "not found"
-        c.clear_bindings(max_scan=3)
-        self.assertEqual(len(c._session.posts), 3)
+    def test_clear_bindings_uses_one_bulk_delete(self):
+        # clear_bindings now lists current bindings then sends ONE
+        # bulk delete with all names — not a per-name loop.
+        c = _make_client({'error_code': 0, 'ip_mac_bind': {'user_bind': [
+            {'user_bind_1': {'ip': '192.0.2.1', 'mac': 'aa-bb-cc-dd-ee-01'}},
+            {'user_bind_2': {'ip': '192.0.2.2', 'mac': 'aa-bb-cc-dd-ee-02'}},
+        ]}})
+        # second response = the delete; queue both
+        c._session.payload = {'error_code': 0}
+        n = c.clear_bindings()
+        self.assertEqual(n, 2)
+        # Two POSTs: list + bulk delete.
+        self.assertEqual(len(c._session.posts), 2)
+        self.assertEqual(c._session.posts[1]['json']['method'], 'delete')
+        self.assertEqual(
+            c._session.posts[1]['json']['ip_mac_bind']['name'],
+            ['user_bind_1', 'user_bind_2'],
+        )
 
 
 class TestClients(unittest.TestCase):

@@ -18,9 +18,11 @@ See MIGRATION.md for the per-command coverage map.
 
 from __future__ import annotations
 
+from typing import Callable, Optional
 from urllib.parse import quote, unquote
 
 from tplinkrouterc6u.client.xdr import TPLinkXDRClient
+from tplinkrouterc6u.common.exception import ClientException
 
 
 class BE7200ApiError(RuntimeError):
@@ -38,23 +40,74 @@ class BE7200Client(TPLinkXDRClient):
     we need. Constructor signature matches the parent so existing call
     sites need no changes when they switch over."""
 
+    # Sentinel set inside _request while a re-auth attempt is in flight,
+    # so a -40401 raised by authorize() itself does not feed back into
+    # another retry (would loop on a wrong saved password forever).
+    _refreshing: bool = False
+
     @classmethod
-    def from_cached_stok(cls, host: str, stok: str) -> 'BE7200Client':
+    def from_cached_stok(
+        cls,
+        host: str,
+        stok: str,
+        *,
+        password: Optional[str] = None,
+        on_token_refresh: Optional[Callable[[str], None]] = None,
+    ) -> 'BE7200Client':
         """Build a client around a previously obtained session token.
 
-        Skips the password / authorize handshake entirely — useful when the
-        caller already has a valid stok cached on disk from a prior login.
-        All read/write methods that go through `_request()` (status, dhcp,
-        ipv4 reservations, set_wifi, logout, ...) work immediately because
-        they only need `self._stok` + `self._session`.
-
-        If the cached token is stale, the router will reject calls with an
-        auth error; the caller is responsible for clearing the cache and
-        falling back to a real password authorize.
+        Skips the password / authorize handshake entirely. If
+        ``password`` is also provided, ``_request()`` will silently
+        re-authorize and retry the call when the router rejects a
+        request with -40401 (stok expired). The optional
+        ``on_token_refresh`` callback receives the new stok so the
+        caller can persist it back to its credential store.
         """
-        client = cls(host, password='')
+        client = cls(host, password=password or '')
         client._stok = stok
+        client._on_token_refresh = on_token_refresh
         return client
+
+    def _request(self, payload: dict) -> dict:
+        """Wrap upstream _request with stok-expiry auto-refresh.
+
+        Behaviour:
+          - First call goes through unchanged.
+          - If the response carries error_code=-40401 *and* we have a
+            saved password *and* we are not already in the middle of a
+            refresh, re-authorize (one retry) and resend the original
+            payload.
+          - The recursion guard ``_refreshing`` ensures that a -40401
+            raised during the refresh authorize itself does not retry
+            again — we re-raise upstream's ClientException so the user
+            sees the real cause.
+
+        Note: upstream returns the JSON dict on success and raises
+        ClientException on transport / decode failures. Auth failures
+        come back as a normal dict with error_code != 0; we sniff that
+        instead of trying to catch a specific exception subclass.
+        """
+        result = super()._request(payload)
+        if (
+            isinstance(result, dict)
+            and result.get('error_code') == -40401
+            and self.password
+            and not self._refreshing
+        ):
+            self._refreshing = True
+            try:
+                self.authorize()
+            finally:
+                self._refreshing = False
+            cb = getattr(self, '_on_token_refresh', None)
+            if cb is not None:
+                try:
+                    cb(self._stok)
+                except Exception:
+                    # Persistence failure must not break the request.
+                    pass
+            result = super()._request(payload)
+        return result
 
     # ========================================================================
     # Low-level request helpers (mirror the original api.API surface)
@@ -199,13 +252,81 @@ class BE7200Client(TPLinkXDRClient):
         return name
 
     def delete_binding(self, name: str) -> None:
-        self.delete("ip_mac_bind", table="user_bind", name=name)
+        """Delete one binding by name.
 
-    def clear_bindings(self, max_scan: int = 200) -> int:
-        """Delete every static binding; returns the highest scanned index."""
-        for i in range(1, max_scan + 1):
-            self.delete_binding(f"user_bind_{i}")
-        return max_scan
+        Earlier versions sent ``{"ip_mac_bind":{"table":"user_bind",
+        "name":"user_bind_X"},"method":"delete"}`` which the TL-7DR7270
+        firmware misinterprets as "delete every row" (verified
+        2026-05-03 by capturing the live web UI's payload). The web UI
+        actually sends ``{"ip_mac_bind":{"name":["user_bind_X"]},
+        "method":"delete"}`` — *no* ``table`` field, and ``name`` must
+        be a list. This method matches that wire format.
+        """
+        body = {"ip_mac_bind": {"name": [name]}, "method": "delete"}
+        # -40205 = "entry not found" is treated as success (idempotent
+        # delete), matching the broader call() / delete() convention.
+        self.call(body, ok_codes=(0, -40205))
+
+    def delete_bindings(self, names: list[str]) -> None:
+        """Delete multiple bindings in a single round-trip.
+
+        Mirrors the web UI's "删除所选" (delete selected) payload, which
+        passes all checked rows in one ``name: [...]`` list.
+        """
+        body = {"ip_mac_bind": {"name": list(names)}, "method": "delete"}
+        self.call(body, ok_codes=(0, -40205))
+
+    def update_binding(
+        self, name: str, *, ip: str, mac: str, hostname: str = ""
+    ) -> None:
+        """In-place update of one binding (web UI's "编辑 → 保存" flow).
+
+        The web UI sends ``{"ip_mac_bind":{"<name>":{"ip","mac",
+        "hostname"}},"method":"set"}`` — note that the binding name is
+        the *key* under ``ip_mac_bind``, not a ``name`` field. This is
+        the only way to rename or fix up one binding without involving
+        delete + add (which would still work, but two round-trips for
+        no reason).
+        """
+        body = {
+            "ip_mac_bind": {name: {
+                "ip": ip,
+                "mac": mac.lower().replace(":", "-"),
+                "hostname": hostname,
+            }},
+            "method": "set",
+        }
+        self.call(body)
+
+    def clear_bindings(self) -> int:
+        """Delete every binding by listing them and sending one bulk
+        ``delete`` request. Returns the number of bindings removed."""
+        names = [b["name"] for b in self.list_bindings()]
+        if names:
+            self.delete_bindings(names)
+        return len(names)
+
+    def rebuild_bindings(self, records: list[dict]) -> int:
+        """Replace the entire ip_mac_bind/user_bind table with ``records``.
+
+        Listed names are deleted in one bulk request, then ``records``
+        are added in order. Returns the number of bindings added.
+
+        Each record is a dict with ``ip``, ``mac``, and optional
+        ``hostname``. Caller is responsible for ensuring ``records``
+        is the desired final state.
+        """
+        old_names = [b["name"] for b in self.list_bindings()]
+        if old_names:
+            self.delete_bindings(old_names)
+        added = 0
+        for r in records:
+            self.add_binding(
+                ip=r["ip"], mac=r["mac"],
+                hostname=r.get("hostname", ""),
+            )
+            added += 1
+        return added
 
     def get_arp(self) -> list[dict]:
         """Return the system ARP table (auto-learned IP/MAC pairs, not bindings)."""

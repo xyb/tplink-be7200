@@ -39,7 +39,14 @@ import json
 import os
 import sys
 
-from . import BE7200Client, BE7200ApiError, __version__, cache
+from typing import Optional
+
+from . import BE7200Client, BE7200ApiError, __version__, credentials
+from requests.exceptions import (
+    ConnectionError as _ReqConnectionError,
+    ConnectTimeout as _ReqConnectTimeout,
+)
+from tplinkrouterc6u.common.exception import ClientException as _UpstreamAuthError
 
 # stale-token signal from the router (auth check failed; cached stok rejected)
 _AUTH_ERROR_CODE = -40401
@@ -59,15 +66,31 @@ def _client(args) -> BE7200Client:
 
     token = args.token or os.environ.get("TPLINK_STOK", "")
     src = "arg/env"
+    saved_password: Optional[str] = None
     if not token and not no_cache:
-        token = cache.load(host) or ""
+        record = credentials.load(host) or {}
+        token = record.get("stok") or ""
+        saved_password = record.get("password") or None
         if token:
-            src = "cache"
+            src = "credentials"
 
     if token:
         if verbose:
             print(f"[token from {src}]", file=sys.stderr)
-        return BE7200Client.from_cached_stok(host, token)
+        # When we also have a saved password, hand it to the client so
+        # _request() can auto-reauthorize on stok expiry without prompt.
+        on_refresh = (
+            (lambda new_stok: credentials.save(
+                host, stok=new_stok, password=saved_password,
+            ))
+            if (saved_password and not no_cache)
+            else None
+        )
+        return BE7200Client.from_cached_stok(
+            host, token,
+            password=saved_password,
+            on_token_refresh=on_refresh,
+        )
 
     password = os.environ.get("TPLINK_PASSWORD", "")
     if password:
@@ -76,7 +99,12 @@ def _client(args) -> BE7200Client:
         client = BE7200Client(host, password)
         client.authorize()
         if not no_cache:
-            cache.save(host, client._stok)
+            credentials.save(host, stok=client._stok, password=password)
+        # Wire the refresh hook so subsequent stok expiries are handled
+        # without re-running the env-driven login flow.
+        client._on_token_refresh = lambda new_stok: credentials.save(
+            host, stok=new_stok, password=password,
+        )
         return client
 
     sys.exit(
@@ -118,11 +146,78 @@ def cmd_login(args):
     if not pwd:
         sys.exit("empty password")
     client = BE7200Client(args.host, pwd)
-    client.authorize()
+    print(f"[info] connecting to http://{args.host}/", file=sys.stderr)
+    try:
+        client.authorize()
+    except _ReqConnectTimeout as e:
+        print(
+            f"ERROR: router unreachable — connect timeout to {args.host}:80.\n"
+            f"  - Common cause: wrong --host. Verify the router IP from your\n"
+            f"    machine's default gateway (e.g. `route get default` on macOS\n"
+            f"    or `ip route` on Linux).\n"
+            f"  - Alternative: device on a different network or router offline.\n"
+            f"  - Override host: --host <router-ip> or export TPLINK_HOST=<router-ip>\n"
+            f"  - Underlying error: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except _ReqConnectionError as e:
+        print(
+            f"ERROR: router unreachable — connection failed to {args.host}:80.\n"
+            f"  - Check network: are you on the LAN? Is the router online?\n"
+            f"  - Verify the host: --host <router-ip> or export TPLINK_HOST=<router-ip>\n"
+            f"  - Underlying error: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except (_UpstreamAuthError, BE7200ApiError) as e:
+        msg = str(e)
+        if "-40401" in msg:
+            print(
+                "ERROR: router rejected login (error_code=-40401, password-attempts limit).\n"
+                "  - Check the password is correct (do NOT retry blindly: each wrong attempt\n"
+                "    burns one of the remaining tries before permanent lockout).\n"
+                "  - Web UI login does NOT reset this counter; wait for the lockout window\n"
+                "    to expire (typically a few minutes after no further attempts).\n"
+                "  - Full router message:\n    " + msg,
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if "HTTP 502" in msg or "HTTP 503" in msg or "HTTP 504" in msg:
+            print(
+                "ERROR: router login endpoint is rate-limited (5xx HTML response).\n"
+                "  - Wait 5-10 minutes for the router to clear the throttle, then retry.\n"
+                "  - Full router message:\n    " + msg,
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        raise
     token = client._stok
     if not args.no_cache:
-        p = cache.save(args.host, token)
-        print(f"# token cached: {p}", file=sys.stderr)
+        # By default we persist the password too, so future commands can
+        # auto-reauthorize on stok expiry without prompting. The user
+        # can opt out with --no-save-password (token only, prompt every
+        # time the stok dies).
+        save_pwd = pwd if not getattr(args, 'no_save_password', False) else None
+        p = credentials.save(args.host, stok=token, password=save_pwd)
+        if save_pwd:
+            print(f"# saved (token+password) to: {p}", file=sys.stderr)
+        else:
+            print(f"# saved (token only, no password) to: {p}", file=sys.stderr)
+    # Identity echo: which router did we actually authenticate against?
+    # Goes to stderr so scripted callers piping the token from stdout are
+    # unaffected. Non-fatal — a transient API blip must not break login.
+    try:
+        lan = client.get_lan() or {}
+        info = client.get_device_info() or {}
+        identity = (
+            f"[info] router IP={lan.get('ipaddr', '?')} "
+            f"MAC={lan.get('macaddr', '?')} "
+            f"model={info.get('device_model', '?')}"
+        )
+        print(identity, file=sys.stderr)
+    except Exception as e:
+        print(f"[info] router identity lookup skipped: {e}", file=sys.stderr)
     if args.export:
         print(f"export TPLINK_STOK={token}")
     elif args.json:
@@ -132,18 +227,23 @@ def cmd_login(args):
 
 
 def cmd_cache_show(args):
-    info = cache.info(args.host)
-    if not info:
-        print(f"no cache for {args.host}")
+    """Show the saved credential record for one host. Password is
+    redacted by default — pass ``--reveal-password`` to print it."""
+    rec = credentials.info(args.host)
+    if not rec:
+        print(f"no saved credentials for {args.host}")
         sys.exit(1)
-    _print(info)
+    if not getattr(args, 'reveal_password', False) and 'password' in rec:
+        rec = dict(rec)
+        rec['password'] = '***redacted (use --reveal-password to show)***'
+    _print(rec)
 
 
 def cmd_cache_clear(args):
-    if cache.clear(args.host):
-        print(f"cleared cache for {args.host}")
+    if credentials.clear(args.host):
+        print(f"cleared credentials for {args.host}")
     else:
-        print(f"no cache for {args.host}")
+        print(f"no saved credentials for {args.host}")
 
 
 def cmd_export(args):
@@ -194,17 +294,49 @@ def cmd_bindings_add(args):
 
 
 def cmd_bindings_delete(args):
+    """Delete one binding by name (safe — list-form payload).
+
+    Note: earlier firmware-version code paths assumed delete truncated
+    the table; that was a payload format error in this client. The
+    web UI's actual delete uses ``name: [list]`` with no ``table``
+    field, which deletes only the named entries.
+    """
     client = _client(args)
     client.delete_binding(args.name)
     print(f"deleted: {args.name}")
 
 
 def cmd_bindings_clear(args):
-    client = _client(args)
     if not args.yes:
         sys.exit("pass --yes to confirm clear")
-    client.clear_bindings(max_scan=args.max_scan)
-    print(f"cleared (scanned 1..{args.max_scan})")
+    client = _client(args)
+    n = client.clear_bindings()
+    print(f"cleared {n} bindings")
+
+
+def cmd_bindings_rename(args):
+    """Rename or remove a single binding.
+
+    Rename uses the web UI's in-place ``set`` payload — one round-trip,
+    no delete needed. Remove uses the safe list-form delete.
+    """
+    client = _client(args)
+    current = client.list_bindings()
+    target_ip = args.ip
+    matched = [b for b in current if b.get('ip') == target_ip]
+    if not matched:
+        sys.exit(f"no binding for ip={target_ip}")
+    if len(matched) > 1:
+        sys.exit(f"ambiguous: {len(matched)} bindings for ip={target_ip}")
+    b = matched[0]
+    if args.remove:
+        client.delete_binding(b['name'])
+        print(f"removed: {b['name']}  {b['ip']}")
+    else:
+        client.update_binding(
+            b['name'], ip=b['ip'], mac=b['mac'], hostname=args.hostname,
+        )
+        print(f"renamed: {b['name']}  {b['ip']}  hostname={args.hostname}")
 
 
 def cmd_bindings_import_csv(args):
@@ -613,6 +745,19 @@ def cmd_clients(args):
         _print(rows)
         return
 
+    # Build IP -> binding-hostname map so we can fill in blanks below.
+    # Soft-fail: a bindings API blip should never break the read-only
+    # clients table, so swallow exceptions and keep going.
+    binding_hostname = {}
+    try:
+        for b in client.list_bindings() or ():
+            ip = (b.get('ip') or '').strip()
+            name = (b.get('hostname') or '').strip()
+            if ip and name:
+                binding_hostname[ip] = name
+    except Exception:
+        pass
+
     def fmt_speed(b):
         b = int(b or 0)
         if b > 1024 * 1024:
@@ -652,13 +797,16 @@ def cmd_clients(args):
     for r in rows:
         wired = r.get("type", "") == "0"
         std = "-" if wired else phy_map.get(r.get("phy_mode", ""), r.get("phy_mode", "-"))
+        hostname = r.get("hostname", "") or ""
+        if not hostname:
+            hostname = binding_hostname.get(r.get("ip", ""), "")
         print(
             f"{r.get('ip','-'):<16} {r.get('mac','-'):<19} "
             f"{link_label(r):<6} "
             f"{std:<7} "
             f"{fmt_time(r.get('online_time')):<8} "
             f"{fmt_speed(r.get('up_speed')):<7} {fmt_speed(r.get('down_speed')):<7} "
-            f"{r.get('hostname','')}"
+            f"{hostname}"
         )
     print(f"\n{len(rows)} client(s)" + (" (incl. offline)" if args.all else " online"))
 
@@ -676,7 +824,7 @@ def build_parser():
     auto_pick_warning = None
     if not default_host:
         try:
-            cached = sorted(p2.stem for p2 in cache.cache_dir().glob("*.json"))
+            cached = sorted(p2.stem for p2 in credentials.config_dir().glob("*.json"))
             if cached:
                 default_host = cached[0]
                 if len(cached) > 1:
@@ -698,15 +846,25 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # login (interactive only — password never via cmdline / stdin pipe to avoid leak)
-    sp = sub.add_parser("login", help="login interactively (getpass), write cache + print token")
+    sp = sub.add_parser("login", help="login interactively (getpass), save credentials + print token")
     sp.add_argument("--export", action="store_true", help="print 'export TPLINK_STOK=...' for eval")
     sp.add_argument("--json", action="store_true", help="JSON output {stok, host}")
+    sp.add_argument(
+        "--no-save-password", action="store_true",
+        help=("only save the token, not the password. token-only mode "
+              "still works but stok expiry will require re-running login."),
+    )
     sp.set_defaults(func=cmd_login)
 
-    # cache
-    sp = sub.add_parser("cache", help="show / clear token cache")
+    # cache (kept name for muscle-memory; backed by credentials store)
+    sp = sub.add_parser("cache", help="show / clear saved credentials")
     sub_c = sp.add_subparsers(dest="action", required=True)
-    sub_c.add_parser("show").set_defaults(func=cmd_cache_show)
+    sp_show = sub_c.add_parser("show")
+    sp_show.add_argument(
+        "--reveal-password", action="store_true",
+        help="print the stored password instead of redacting it",
+    )
+    sp_show.set_defaults(func=cmd_cache_show)
     sub_c.add_parser("clear").set_defaults(func=cmd_cache_clear)
 
     # export
@@ -740,14 +898,21 @@ def build_parser():
     spa.add_argument("--hostname", default="")
     spa.set_defaults(func=cmd_bindings_add)
 
-    spa = sub_b.add_parser("delete")
+    spa = sub_b.add_parser("delete", help="delete one binding by name (safe list-form)")
     spa.add_argument("name", help="e.g. user_bind_3")
     spa.set_defaults(func=cmd_bindings_delete)
 
     spa = sub_b.add_parser("clear", help="delete all static bindings")
     spa.add_argument("--yes", action="store_true", help="confirm")
-    spa.add_argument("--max-scan", type=int, default=200)
     spa.set_defaults(func=cmd_bindings_clear)
+
+    spa = sub_b.add_parser("rename",
+        help="rename or remove a single binding via safe full-table rebuild")
+    spa.add_argument("--ip", required=True, help="bind whose IP to operate on")
+    grp = spa.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--hostname", help="new hostname (rename)")
+    grp.add_argument("--remove", action="store_true", help="remove this binding")
+    spa.set_defaults(func=cmd_bindings_rename)
 
     spa = sub_b.add_parser("import-csv", help="bulk import from csv")
     spa.add_argument("path", help="csv with columns mac,ip,hostname")
@@ -964,7 +1129,7 @@ def main():
         # If the cached token is stale, try to clear it and re-login if a
         # password is available; otherwise surface the error.
         if e.code == _AUTH_ERROR_CODE and not getattr(args, "no_cache", False):
-            cache.clear(args.host)
+            credentials.clear(args.host)
             if os.environ.get("TPLINK_PASSWORD"):
                 print("[cached token stale; cleared cache, retry the command]", file=sys.stderr)
             else:

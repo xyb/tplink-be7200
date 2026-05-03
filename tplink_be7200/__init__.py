@@ -6,8 +6,14 @@ read paths are upstream `tplinkrouterc6u.TPLinkXDRClient`; this package
 adds the extended write surface and the local stok cache.
 """
 
-from . import cache
+from . import credentials
 from .client import BE7200ApiError, BE7200Client
 
-__all__ = ["BE7200Client", "BE7200ApiError", "cache"]
+# Backwards-compat alias: old code (and any vendored scripts) imported
+# `from tplink_be7200 import cache`. The module was renamed to
+# `credentials` to reflect that it stores a password, not a cache.
+# Drop this alias once external callers are confirmed migrated.
+cache = credentials
+
+__all__ = ["BE7200Client", "BE7200ApiError", "credentials", "cache"]
 __version__ = "0.2.0"
